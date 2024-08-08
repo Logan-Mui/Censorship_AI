@@ -1,0 +1,281 @@
+!pip install transformers datasets evaluate accelerate
+
+from huggingface_hub import notebook_login
+notebook_login()
+
+from datasets import load_dataset, Dataset, DatasetDict
+import evaluate
+import numpy as np
+import pandas as pd
+from transformers import DataCollatorWithPadding, AutoModelForSequenceClassification, TrainingArguments, Trainer
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+mysheet = "https://docs.google.com/spreadsheets/d/10gHvc3GQNgEi_o3v-X_mt9bfcFkhndL_E6gWeJZ2C0A/export?format=csv"
+df = pd.read_csv(mysheet)
+df = df.iloc[:100]
+
+df.Harmfulcontent = df.Harmfulcontent.astype(int)
+df.Bias = df.Bias.astype(int)
+df.Misinformation = df.Misinformation.astype(int)
+df.Politicalcontent = df.Politicalcontent.astype(int)
+
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("distilbert/distilbert-base-uncased")
+def preprocess_function(examples):
+    return tokenizer(examples["text"], truncation=True)
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+def init_datasets(test_num):
+  accuracy = evaluate.load("accuracy")
+  bias_train = pd.concat([df[["Full_conversation","Bias"]].loc[:test_num],df[["Full_conversation","Bias"]].loc[((test_num+1)-99):]])
+  bias_train.columns = ['text', 'label']
+  bias_train = Dataset.from_pandas(bias_train, split = "train")
+  bias_train = bias_train.map(preprocess_function)
+  bias_test  = df[["Full_conversation","Bias"]].loc[test_num]
+
+  harmful_train = pd.concat([df[["Full_conversation","Harmfulcontent"]].loc[:test_num],df[["Full_conversation","Harmfulcontent"]].loc[((test_num+1)-99):]])
+  harmful_train.columns = ['text', 'label']
+  harmful_train = Dataset.from_pandas(harmful_train, split = "train")
+  harmful_train = bias_train.map(preprocess_function)
+  harmful_test  = df[["Full_conversation","Harmfulcontent"]].loc[test_num]
+
+  misinformation_train = pd.concat([df[["Full_conversation","Misinformation"]].loc[:test_num],df[["Full_conversation","Misinformation"]].loc[((test_num+1)-99):]])
+  misinformation_train.columns = ['text', 'label']
+  misinformation_train = Dataset.from_pandas(misinformation_train, split = "train")
+  misinformation_train = bias_train.map(preprocess_function)
+  misinformation_test  = df[["Full_conversation","Misinformation"]].loc[test_num]
+
+  political_train = pd.concat([df[["Full_conversation","Politicalcontent"]].loc[:test_num],df[["Full_conversation","Politicalcontent"]].loc[((test_num+1)-99):]])
+  political_train.columns = ['text', 'label']
+  political_train = Dataset.from_pandas(political_train, split = "train")
+  political_train = bias_train.map(preprocess_function)
+  political_test  = df[["Full_conversation","Politicalcontent"]].loc[test_num]
+
+  return bias_train, bias_test, harmful_train, harmful_test, misinformation_train, misinformation_test, political_train, political_test, data_collator, accuracy
+
+id2label = {0: "Safe", 1: "Unsure", 2: "Unsafe"}
+label2id = {"Safe": 0, "Unsure": 1, "Unsafe":2}
+
+def compute_metrics(eval_pred):
+      predictions, labels = eval_pred
+      predictions = np.argmax(predictions, axis=1)
+      return accuracy.compute(predictions=predictions, references=labels)
+
+def init_model():
+  model = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert/distilbert-base-uncased", num_labels=3, id2label=id2label, label2id=label2id
+)
+  return model
+
+'''
+model_bias = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert/distilbert-base-uncased", num_labels=3, id2label=id2label, label2id=label2id
+)
+model_harmful = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert/distilbert-base-uncased", num_labels=3, id2label=id2label, label2id=label2id
+)
+model_misinformation = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert/distilbert-base-uncased", num_labels=3, id2label=id2label, label2id=label2id
+)
+model_political = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert/distilbert-base-uncased", num_labels=3, id2label=id2label, label2id=label2id
+)
+'''
+
+training_args = TrainingArguments(
+  output_dir="logans_awesome_model",
+  learning_rate=2e-5,
+  per_device_train_batch_size=16,
+  per_device_eval_batch_size=16,
+  num_train_epochs=16,
+  weight_decay=0.01,
+  evaluation_strategy="epoch",
+  save_strategy="epoch",
+  load_best_model_at_end=True,
+  #push_to_hub=True,
+)
+
+def init_trainer(model,training_dataset):
+      trainer = Trainer(
+      model=model,
+      args=training_args,
+      train_dataset=training_dataset,
+      eval_dataset=training_dataset,
+      tokenizer=tokenizer,
+      data_collator=data_collator,
+      compute_metrics=compute_metrics,
+    )
+      trainer.train()
+
+from transformers import pipeline
+
+def init_classifier(model):
+  classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
+  return classifier
+
+def init_results(classifier,training_dataset):
+  results = classifier(training_dataset["text"])
+  return results
+
+references_bias = []
+references_harmful = []
+references_misinformation = []
+references_political = []
+
+predictions_bias = []
+predictions_harmful = []
+predictions_political = []
+predictions_misinformation = []
+# predictions_political = []
+
+def test_model(testing_dataset,expected_vals,classifier):
+  results = classifier(testing_dataset["Full_conversation"])
+  results = [label2id[results[0]['label']]]
+  return results
+
+
+bias_expected = []
+harmful_expected = []
+misinformation_expected = []
+political_expected = []
+
+results_bias = []
+results_harmful = []
+results_misinformation = []
+results_political = []
+
+
+for i in range(50):
+
+  #init full dataset using test case index
+  bias_train, bias_test, harmful_train, harmful_test, misinformation_train, misinformation_test, political_train, political_test, data_collator, accuracy = init_datasets(i)
+
+  #init all models
+  model_bias = init_model()
+  model_harmful = init_model()
+  model_misinformation = init_model()
+  model_political = init_model()
+
+  #init all trainers
+  trainer_bias = init_trainer(model_bias,bias_train)
+  trainer_political = init_trainer(model_political,political_train)
+  trainer_harmful = init_trainer(model_harmful,harmful_train)
+  trainer_misinformation = init_trainer(model_misinformation,misinformation_train)
+
+
+  #train the trainers
+  trainer_bias.train()
+  trainer_harmful.train()
+  trainer_misinformation.train()
+  trainer_political.train()
+
+  #init classifier
+  classifier_bias = init_classifier(model_bias)
+  classifier_harmful = init_classifier(model_harmful)
+  classifier_misinformation = init_classifier(model_misinformation)
+  classifier_political = init_classifier(model_political)
+
+  #generate results
+  results_bias = init_results(classifier_bias,bias_train)
+  results_harmful = init_results(classifier_harmful,harmful_train)
+  results_misinformation = init_results(classifier_misinformation,misinformation_train)
+  results_political = init_results(classifier_political,political_train)
+
+  #init expected
+  bias_expected.append([bias_test.Bias])
+
+  harmful_expected.append([harmful_test.Harmfulcontent])
+
+  misinformation_expected.append([misinformation_test.Misinformation])
+
+  political_expected.append([political_test.Politicalcontent])
+
+
+  #testing
+  results_bias.append(test_model(bias_test,bias_expected,classifier_bias))
+
+  results_harmful.append(test_model(harmful_test,harmful_expected,classifier_harmful))
+
+  results_misinformation.append(test_model(misinformation_test,misinformation_expected,classifier_misinformation))
+
+  results_political.append(test_model(political_test,political_expected,classifier_political))
+
+
+def get_expected_list(expected):
+  new_expected = []
+  for i in range(len(expected)):
+    new_expected.append(expected[i][0])
+  return new_expected
+
+
+def get_results_list(results, given_range):
+  new_expected = []
+  for i in range(given_range):
+    new_expected.append(label2id[results_bias[i]["label"]])
+  return new_expected
+
+
+
+accuracy_bias = evaluate.load("accuracy")
+accuracy_harmful = evaluate.load("accuracy")
+accuracy_misinformation = evaluate.load("accuracy")
+accuracy_political = evaluate.load("accuracy")
+
+precision_bias = evaluate.load('precision')
+precision_harmful = evaluate.load('precision')
+precision_misinformation = evaluate.load('precision')
+precision_political = evaluate.load('precision')
+
+recall_bias = evaluate.load('recall')
+recall_harmful = evaluate.load('recall')
+recall_misinformation = evaluate.load('recall')
+recall_political = evaluate.load('recall')
+
+f1_score_bias = evaluate.load('f1', average='micro')
+f1_score_harmful = evaluate.load('f1', average='micro')
+f1_score_misinformation = evaluate.load('f1', average='micro')
+f1_score_political = evaluate.load('f1', average='micro')
+
+ref_bias = get_expected_list(bias_expected)
+res_bias = get_results_list(results_bias, len(bias_expected))
+
+ref_harm = get_expected_list(harmful_expected)
+res_harm = get_results_list(results_harmful, len(bias_expected))
+
+ref_mis = get_expected_list(misinformation_expected)
+res_mis = get_results_list(results_misinformation, len(bias_expected))
+
+ref_pol = get_expected_list(political_expected)
+res_pol = get_results_list(results_political, len(bias_expected))
+
+print(accuracy_bias.compute(references=ref_bias, predictions=res_bias))
+print(accuracy_harmful.compute(references=ref_harm, predictions=res_harm))
+print(accuracy_misinformation.compute(references=ref_mis, predictions=res_mis))
+print(accuracy_political.compute(references=ref_pol, predictions=res_pol))
+
+
+
+print(precision_bias.compute(references=ref_bias, predictions=res_bias, average="macro"))
+print(precision_harmful.compute(references=ref_harm, predictions=res_harm, average="macro"))
+print(precision_misinformation.compute(references=ref_mis, predictions=res_mis, average="macro"))
+print(precision_political.compute(references=ref_pol, predictions=res_pol, average="macro"))
+
+
+
+print(recall_bias.compute(references=ref_bias, predictions=res_bias, average="macro"))
+print(recall_harmful.compute(references=ref_harm, predictions=res_harm, average="macro"))
+print(recall_misinformation.compute(references=ref_mis, predictions=res_mis, average="macro"))
+print(recall_political.compute(references=ref_pol, predictions=res_pol, average="macro"))
+
+
+
+print(f1_score_bias.compute(references=ref_bias, predictions=res_bias, average="macro"))
+print(f1_score_harmful.compute(references=ref_harm, predictions=res_harm, average="macro"))
+print(f1_score_misinformation.compute(references=ref_mis, predictions=res_mis, average="macro"))
+print(f1_score_political.compute(references=ref_pol, predictions=res_pol, average="macro"))
+
+
+
